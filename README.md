@@ -58,7 +58,7 @@ Vinext + React · localhost:3000
 ## 环境要求
 
 - macOS（真实微信数据模式需要 App Store 版微信）。
-- Node.js `>= 22.13.0`，推荐使用仓库 `.nvmrc` 指定的版本。
+- Node.js `>= 24.18.0`，推荐使用仓库 `.nvmrc` 指定的 LTS 版本。项目直接使用 Node 的 TypeScript 类型剥离和 Zstandard API，较旧运行时无法执行完整测试与本地数据库解析。
 - npm `>= 10`。
 - 可选：OpenAI Whisper、Python 和 `ffmpeg`，用于本机语音转写。
 - 可选：兼容的 SILK 解码模块，用于微信 SILK 语音。
