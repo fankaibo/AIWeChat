@@ -1,6 +1,7 @@
 # Weixin AgentOS
 
 [![CI](https://github.com/fankaibo/AIWeChat/actions/workflows/ci.yml/badge.svg)](https://github.com/fankaibo/AIWeChat/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Weixin AgentOS 是一个面向个人 Mac 的本地微信只读工作台。它从用户自行准备的微信本地只读快照中读取会话、联系人和媒体，通过网页提供浏览、搜索、统计以及带原文引用的 LLM 对话。
 
@@ -29,6 +30,18 @@ Weixin AgentOS 是一个面向个人 Mac 的本地微信只读工作台。它从
 - `.env`、数据库、密钥、日志、LLM 历史、转写缓存和媒体全部被 Git 忽略。
 
 完整约束见 [SECURITY.md](SECURITY.md)。
+
+## 已验证微信版本
+
+| 项目 | 已验证基线 |
+| --- | --- |
+| 客户端来源 | Mac App Store |
+| 微信 for macOS | `4.1.11` |
+| 微信内部 build | `269136` |
+| Bundle ID | `com.tencent.xinWeChat` |
+| 验证日期 | `2026-08-10` |
+
+上述版本已完成会话、联系人、消息、媒体数据库和实时只读同步的本机验证。它是当前兼容基线，不代表更早或更新的微信版本一定可用；微信升级可能改变数据库 schema、加密页或媒体格式。提交兼容性修复时，请在 Pull Request 中注明微信版本与 build，但不要附带真实数据库、密钥、聊天内容或本机路径。
 
 ## 架构
 
@@ -286,4 +299,6 @@ npm run check
 
 ## License
 
-本仓库当前未声明开源许可。除非仓库所有者另行授权，保留所有权利。
+本项目采用 [MIT License](LICENSE)。你可以使用、复制、修改、合并、发布、分发、再许可或销售本软件的副本，但必须保留许可证中的版权和许可声明。
+
+Weixin AgentOS 不是腾讯或微信官方项目。“微信”“WeChat”及相关商标归其权利人所有。开源许可仅覆盖本仓库代码，不授予任何第三方商标、微信客户端、用户数据或其他第三方内容的权利。
