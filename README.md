@@ -16,7 +16,7 @@ Weixin AgentOS 是一个面向个人 Mac 的本地微信只读工作台。它从
 - 图片原图预览、视频/封面解析、语音本机 Whisper 转写。
 - 引用/回复消息还原，链接、文件、系统消息和合并记录摘要展示。
 - 本地规则总结、待办/风险提取、月度聊天热力图。
-- 多模型 LLM 工作区、显式消息引用、可回跳的 `[M#]` 引用和本机历史。
+- 多模型 LLM 工作区、SSE 流式回答、显式消息引用、可回跳的 `[M#]` 引用和本机历史。
 - 一键隐私首页，隐藏会话列表和聊天正文。
 
 ## 安全边界
@@ -162,11 +162,20 @@ WEIXIN_LLM_KEY_FILE=disabled
 ```dotenv
 WEIXIN_WHISPER_PATH=/absolute/path/to/whisper
 WEIXIN_WHISPER_PYTHON=/absolute/path/to/python
-WEIXIN_WHISPER_MODEL=base
+WEIXIN_WHISPER_MODEL=small
 WEIXIN_WHISPER_LANGUAGE=zh
+WEIXIN_WHISPER_BEAM_SIZE=5
 ```
 
-语音仅在用户点击“转为文字”后处理，不会批量转写或上传。结果保存在被忽略的 `.local/voice-transcripts/` 中。
+微信语音通常是 SILK 数据。请在 `WEIXIN_WHISPER_PYTHON` 指向的同一个虚拟环境中安装解码器：
+
+```bash
+python -m pip install silk-python==0.2.8
+```
+
+页面遇到当前已加载聊天中的语音后，会在本机按“最新优先、一次一条”的顺序自动转写；不会扫描尚未打开的全部历史，也不会上传音频。失败时仍可手动重试。结果保存在被忽略的 `.local/voice-transcripts/` 中，并按模型、语言和缓存版本校验，升级模型后不会误用旧结果。
+
+默认使用 `small` 与 beam search，在中文准确率、首次下载大小和 CPU 速度之间取平衡。更重视准确率且能接受更高内存/等待时间时，可把模型改为 `medium`；需要补充固定人名或术语时，可用 `WEIXIN_WHISPER_INITIAL_PROMPT` 提供一小段上下文。实时快照还必须包含已解密的 `message/media_*.db`；设置页会分别显示 Whisper、ffmpeg、SILK 解码器和媒体数据库的就绪状态。
 
 ## 构建与验证
 
@@ -270,7 +279,7 @@ npm run check
 ## 已知限制
 
 - 未读数来自微信本地会话表；本网页不能写已读状态。
-- LLM 当前为非流式请求，尚无中途取消。
+- LLM 使用 SSE 流式展示回答；当前尚无手动“停止生成”按钮。
 - 搜索和部分分析使用有上限的消息窗口，不等同于完整语义索引。
 - 已被微信清理或从未下载的历史媒体无法恢复。
 - 微信数据库结构或媒体格式升级后可能需要只读兼容更新。

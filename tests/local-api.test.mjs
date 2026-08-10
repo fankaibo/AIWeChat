@@ -41,6 +41,8 @@ test("local API is read-only and safely falls back to demo data", async () => {
   assert.equal(health.llmConfigured, false);
   assert.equal(health.voiceTranscription.localOnly, true);
   assert.equal(health.voiceTranscription.engine, "openai-whisper-local");
+  assert.equal(health.voiceTranscription.mediaDatabaseReady, false);
+  assert.equal(health.voiceTranscription.wechatVoiceReady, false);
   assert.equal(health.sync.mode, "demo");
   assert.equal(health.sync.readonly, true);
   const sync = await fetch(`http://127.0.0.1:${port}/api/sync/status`).then((response) => response.json());
@@ -115,4 +117,14 @@ test("sessions, messages, search and agent endpoints respond", async () => {
   });
   assert.equal(llmResponse.status, 503);
   assert.equal((await llmResponse.json()).code, "LLM_NOT_CONFIGURED");
+  const streamedLlmResponse = await fetch(`http://127.0.0.1:${port}/api/llm/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: sessions.sessions[0].username, question: "结论是什么？", stream: true }),
+  });
+  assert.equal(streamedLlmResponse.status, 200);
+  assert.match(streamedLlmResponse.headers.get("content-type") || "", /^text\/event-stream/);
+  const streamedBody = await streamedLlmResponse.text();
+  assert.match(streamedBody, /event: error/);
+  assert.match(streamedBody, /LLM_NOT_CONFIGURED/);
 });

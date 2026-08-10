@@ -80,7 +80,7 @@
 - `local/wechat-media.mjs`：微信图片资源定位与解码。
 - `local/media-worker.mjs`：图片解码隔离进程。
 - `local/video-worker.mjs`：视频路径/封面解析隔离进程。不要把视频目录扫描重新放回消息列表主请求。
-- `local/voice-transcriber.mjs`：按需读取语音、SILK/ffmpeg 转码、Whisper 和本机缓存。
+- `local/voice-transcriber.mjs`：读取语音、SILK/ffmpeg 转码、Whisper 质量参数和按模型版本隔离的本机缓存。
 - `local/agent.mjs`：纯本地规则总结/问答，不调用 LLM。
 - `local/llm.mjs`：相关上下文选择、Responses/Chat Completions 请求和引用映射。
 - `local/model-catalog.mjs`：解析凭据文件、构造公开模型目录。默认模型 ID 是 `opencode-gpt-5.6-sol`。
@@ -107,12 +107,12 @@
 - 文本保留换行/段落；长 URL 和长单词不会撑出消息气泡。
 - 图片支持缩略图、原图优先的灯箱预览和实际像素模式。
 - 视频由浏览器按需请求后端解析，避免阻塞会话加载。
-- 语音由用户点击后调用本机 Whisper，结果只缓存到 `.local/voice-transcripts/`。
+- 当前已加载会话中的语音会最新优先、串行调用本机 Whisper 自动转写；不会主动扫描未打开的全量历史，失败项允许手动重试，结果只缓存到 `.local/voice-transcripts/`。
 - 链接、文件、系统消息、引用回复、合并聊天记录摘要已有渲染；引用消息会尽可能恢复头像/发送者/正文并跳回原文。
 - 月度聊天热力图支持当前聊天和全部聊天统计。
 - 本地标签是无模型的规则分析，支持结论/待办/风险筛选，关键信号按时间倒序。
 - LLM 模型选择已并入输入区，当前引用显示在输入框上方，默认选择 GPT 5.6 Sol。
-- LLM 回答支持易读 Markdown、引用标记和跳回消息；历史可查询、恢复和继续。
+- LLM 回答通过本地 SSE 增量展示，支持易读 Markdown、引用标记和跳回消息；历史在完整回答结束后写入，可查询、恢复和继续。
 - 点击自己的头像会进入隐私首页，同时隐藏会话栏目和聊天详情。
 - 没有任何消息发送接口。
 
@@ -124,7 +124,7 @@
 - OpenAI Responses 请求保持 `store: false`。
 - 默认相关上下文上限是 120 条消息，环境变量允许 20–300；这不是 token 预算。
 - 手动引用最多 20 个 ID；前端当前保留最近 6 条待引用消息。
-- LLM 请求当前非流式，默认 90 秒超时，环境上限 180 秒。
+- `/api/llm/chat` 在 `stream: true` 时返回本地 SSE 事件：`start`、`delta`、`done` 或 `error`；非流式分支保留用于兼容和探测。默认 90 秒超时，环境上限 180 秒。
 - 历史默认写入 `.local/llm-history.json`，只保留问答、引用和模型元数据，不要扩展成完整聊天镜像。
 - 模型可用性在用户主动探测或首次提问后更新；不要在启动时对所有计费端点批量请求。
 
@@ -149,7 +149,7 @@
 | POST | `/api/agent/ask` | 本地规则问答 |
 | GET | `/api/llm/status` | 无秘密的模型与历史状态 |
 | POST | `/api/llm/probe` | 用户触发的单模型可用性探测 |
-| POST | `/api/llm/chat` | LLM 对话、引用和历史记录 |
+| POST | `/api/llm/chat` | LLM 对话、引用和历史记录；`stream: true` 返回 SSE |
 | GET | `/api/llm/history` | LLM 历史列表 |
 | GET | `/api/llm/history/:id` | 恢复一条历史 |
 
@@ -199,11 +199,11 @@ npm run check
 
 ## 10. 已知限制与适合的下一步
 
-- LLM 尚未流式输出，也没有取消按钮。
+- LLM 已流式输出，但还没有手动“停止生成”按钮。
 - LLM 上下文选择按消息数，尚未做精确 token 预算和会话级语义索引。
 - 合并聊天记录只展示摘要，尚未展开所有嵌套项。
 - 历史媒体可能已被微信删除或未下载；这类资源无法从数据库凭空恢复。
-- 微信 SILK 语音是否可转写取决于本机解码环境。
+- 微信 SILK 语音是否可转写取决于本机 Whisper、ffmpeg、`silk-python` 解码环境，以及只读快照是否包含已解密的 `message/media_*.db`。默认 `small + beam_size 5`，可通过环境变量覆盖模型和术语提示。
 - 微信版本/schema/媒体算法变化时，应先用复制出的测试快照做只读兼容分析，再改解析器。
 - 若未来确实需要“创建待办”等本地联动，优先设计显式用户确认的本机 action adapter；不要让 LLM 直接执行副作用操作，也不要把它与微信发送能力混在一起。
 

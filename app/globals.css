@@ -444,8 +444,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .llm-turn.user { margin-left: 28px; border-color: #ddb79c; border-radius: 12px 12px 4px 12px; background: #f1d2bc; }
 .llm-turn.error { border-color: #e0b9b6; background: #faecea; }
 .llm-turn.pending { color: var(--muted); }
+.llm-turn.streaming { border-color: #d8b59e; box-shadow: inset 2px 0 0 #bd6740; }
 .llm-turn-meta { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; }
-.llm-turn-meta span { color: var(--accent-dark); font-size: 11px; font-weight: 800; }
+.llm-turn-meta span { display: inline-flex; align-items: center; gap: 7px; color: var(--accent-dark); font-size: 11px; font-weight: 800; }
+.llm-turn-meta small { padding: 2px 5px; border-radius: 999px; color: #8a5a42; background: #f2dfd2; font-size: 8px; font-weight: 700; }
 .llm-turn-meta button { border: 0; color: var(--accent); background: transparent; cursor: pointer; font-size: 10.5px; }
 .llm-turn > p { margin: 0; white-space: pre-wrap; color: #514740; font-size: 13.5px; line-height: 1.75; }
 .llm-readable { color: #4f453f; font-size: 13.5px; line-height: 1.78; overflow-wrap: anywhere; }
