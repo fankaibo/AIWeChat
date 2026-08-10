@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
-import { chatWithLlm, llmConfig, publicLlmStatus, selectContext } from "../local/llm.mjs";
+import { chatWithLlm, llmConfig, publicLlmStatus, selectContext, streamChatWithLlm } from "../local/llm.mjs";
 import { buildModelCatalog, parseCredentialText, publicModelCatalog } from "../local/model-catalog.mjs";
 
 test("credential text becomes a safe multi-provider model catalog", () => {
@@ -114,4 +114,69 @@ test("Chat Completions models use the selected safe catalog entry", async (t) =>
   assert.equal(result.modelId, "safe-test-model");
   assert.equal(result.citations[0].id, "b");
   assert.equal(result.usage.totalTokens, 98);
+});
+
+test("Responses API streams text deltas and returns the final cited result", async (t) => {
+  let requestBody;
+  const mock = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_stream","model":"gpt-5.6"}}\n\n');
+    response.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"迁移风险"}\n\n');
+    response.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"是超时。[M2]"}\n\n');
+    response.end('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_stream","model":"gpt-5.6","usage":{"input_tokens":30,"output_tokens":8,"total_tokens":38}}}\n\n');
+  });
+  await new Promise((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  t.after(() => mock.close());
+  const address = mock.address();
+  const config = llmConfig({ OPENAI_API_KEY: "secret", WEIXIN_LLM_BASE_URL: `http://127.0.0.1:${address.port}/v1`, WEIXIN_LLM_MODEL: "gpt-5.6" });
+  const deltas = [];
+  const result = await streamChatWithLlm({
+    question: "迁移风险是什么？",
+    session: { name: "测试群" },
+    messages: [
+      { id: "a", sender: "林然", content: "讨论发布计划", timestamp: 1, type: "text" },
+      { id: "b", sender: "陈川", content: "迁移可能超时", timestamp: 2, type: "text" },
+    ],
+  }, config, { onDelta: (delta) => deltas.push(delta) });
+  assert.equal(requestBody.stream, true);
+  assert.equal(requestBody.store, false);
+  assert.deepEqual(deltas, ["迁移风险", "是超时。[M2]"]);
+  assert.equal(result.answer, "迁移风险是超时。[M2]");
+  assert.equal(result.citations[0].id, "b");
+  assert.equal(result.usage.totalTokens, 38);
+});
+
+test("Chat Completions streaming hides provider think blocks", async (t) => {
+  const mock = createServer(async (request, response) => {
+    for await (const _chunk of request) void _chunk;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"id":"chat_stream","model":"provider-test-model","choices":[{"delta":{"content":"<think>内部"}}]}\n\n');
+    response.write('data: {"id":"chat_stream","model":"provider-test-model","choices":[{"delta":{"content":"推理</think>负责人"}}]}\n\n');
+    response.write('data: {"id":"chat_stream","model":"provider-test-model","choices":[{"delta":{"content":"是陈川。[M2]"}}]}\n\n');
+    response.end('data: {"id":"chat_stream","model":"provider-test-model","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":6,"total_tokens":26}}\n\ndata: [DONE]\n\n');
+  });
+  await new Promise((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  t.after(() => mock.close());
+  const address = mock.address();
+  const catalog = {
+    configured: true,
+    defaultModelId: "safe-test-model",
+    models: [{ id: "safe-test-model", name: "测试模型", provider: "测试提供方", providerId: "test", model: "provider-test-model", endpoint: `http://127.0.0.1:${address.port}/chat/completions`, protocol: "chat-completions", reasoning: "default", contextLimit: 120, timeoutMs: 10_000, apiKeys: ["fake-secret"] }],
+  };
+  const deltas = [];
+  const result = await streamChatWithLlm({
+    modelId: "safe-test-model",
+    question: "负责人是谁？",
+    session: { name: "测试群" },
+    messages: [
+      { id: "a", sender: "林然", content: "讨论发布计划", timestamp: 1, type: "text" },
+      { id: "b", sender: "陈川", content: "我负责迁移", timestamp: 2, type: "text" },
+    ],
+  }, catalog, { onDelta: (delta) => deltas.push(delta) });
+  assert.deepEqual(deltas, ["负责人", "是陈川。[M2]"]);
+  assert.equal(result.answer, "负责人是陈川。[M2]");
+  assert.equal(result.usage.totalTokens, 26);
 });

@@ -12,10 +12,25 @@ test("voice transcript cache is local, stable and scoped to one WeChat message",
     const first = { username: "room@chatroom", localId: 42, serverId: "9007199254740993123", createTime: 123_000 };
     const second = { ...first, localId: 43 };
     mkdirSync(directory, { recursive: true });
-    writeFileSync(transcriber.cachePath(first), JSON.stringify({ status: "available", transcript: "明天下午三点开会", engine: "openai-whisper-local", model: "base" }));
+    writeFileSync(transcriber.cachePath(first), JSON.stringify({ status: "available", transcript: "明天下午三点开会", engine: "openai-whisper-local", model: "base", language: "zh", cacheVersion: 2 }));
     assert.equal(transcriber.cached(first)?.transcript, "明天下午三点开会");
     assert.equal(transcriber.cached(second), null);
     assert.equal(transcriber.status().localOnly, true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("voice transcript cache is invalidated when the recognition model changes", () => {
+  const directory = mkdtempSync(join(tmpdir(), "weixin-agentos-voice-model-cache-"));
+  try {
+    const identity = { username: "room@chatroom", localId: 8, serverId: "88", createTime: 456_000 };
+    const base = new LocalVoiceTranscriber({ whisperPath: "/bin/echo", pythonPath: "/bin/echo", ffmpegPath: "/bin/echo", cacheDir: directory, model: "base" });
+    const small = new LocalVoiceTranscriber({ whisperPath: "/bin/echo", pythonPath: "/bin/echo", ffmpegPath: "/bin/echo", cacheDir: directory, model: "small" });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(base.cachePath(identity), JSON.stringify({ status: "available", transcript: "旧模型结果", engine: "openai-whisper-local", model: "base", language: "zh", cacheVersion: 2 }));
+    assert.equal(base.cached(identity)?.transcript, "旧模型结果");
+    assert.equal(small.cached(identity), null);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -10,6 +10,8 @@ Weixin AgentOS is a local-first, read-only personal project. Changes must preser
 4. Keep changes small and add regression tests for behavior or parsing changes.
 5. Run `npm run check` before opening a pull request.
 
+For WeChat schema, decryption, media, or message parsing changes, include the tested WeChat version, internal build, and distribution channel in the pull request. Use generated fixtures only; never attach real databases, keys, account identifiers, chat content, media, or machine paths.
+
 Use [Conventional Commits](https://www.conventionalcommits.org/) for commit subjects, for example:
 
 ```text
@@ -27,3 +29,5 @@ docs(readme): clarify local snapshot setup
 - Use generated fixtures and temporary databases in tests. Never copy real contacts, chats, avatars, media, paths, keys, or exports into fixtures.
 
 See [SECURITY.md](SECURITY.md) before handling credentials or local data paths.
+
+By contributing, you agree that your contribution is licensed under the repository's [MIT License](LICENSE).

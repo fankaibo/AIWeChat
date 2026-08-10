@@ -19,11 +19,14 @@ type Citation = { id: string | number; sender: string; content: string; timestam
 type LlmModel = { id: string; name: string; provider: string; model: string; api: string; reasoning: string; contextWindow: number | null; credentialReady: boolean; verified: boolean; availability?: "ready" | "unavailable" | "unverified"; lastError?: string; lastCheckedAt?: number };
 type LlmHistoryStatus = { enabled: boolean; localOnly: boolean; conversationCount: number; maxConversations: number; maxTurns: number; location: string; error?: string };
 type LlmStatus = { configured: boolean; provider: string; model: string; modelId: string; reasoning: string; contextLimit: number; localProvider: boolean; api: string; store: boolean; uploadPolicy: string; models: LlmModel[]; defaultModelId: string; credentialSource: string; credentialFileSecure: boolean | null; credentialCounts: Record<string, number>; warnings: string[]; history: LlmHistoryStatus };
-type LlmTurn = { id: string; role: "user" | "assistant"; content: string; citations?: (Citation & { label?: string })[]; model?: string; contextMessages?: number; usage?: { inputTokens: number; outputTokens: number; totalTokens: number }; error?: boolean; createdAt?: number };
+type LlmTurn = { id: string; role: "user" | "assistant"; content: string; citations?: (Citation & { label?: string })[]; model?: string; contextMessages?: number; usage?: { inputTokens: number; outputTokens: number; totalTokens: number }; error?: boolean; streaming?: boolean; createdAt?: number };
+type LlmChatResult = { answer: string; citations?: (Citation & { label?: string })[]; model?: string; contextMessages?: number; usage?: LlmTurn["usage"]; conversationId?: string };
 type LlmHistorySummary = { id: string; username: string; sessionName: string; title: string; preview: string; createdAt: number; updatedAt: number; turnCount: number; modelId: string; model: string; provider: string };
 type LlmHistoryRecord = LlmHistorySummary & { turns: LlmTurn[] };
 type SyncStatus = { mode: string; state: string; revision: string; contactRevision?: string; readonly: boolean; lastSyncAt: number; lagMs: number | null; watchedDatabases?: number; pollMs?: number; retryMs?: number; syncStrategy?: "full" | "incremental"; reusedDatabases?: number; decryptedDatabases?: number; checkedDatabases?: number; snapshotMs?: number; lastError?: string };
-type ServiceStatus = { source: string; ok: boolean; readonly: boolean; sync?: SyncStatus };
+type VoiceTranscriptionStatus = { configured: boolean; whisperReady: boolean; silkDecoderReady: boolean; ffmpegReady: boolean; mediaDatabaseReady: boolean; wechatVoiceReady: boolean; model: string; blockers: string[] };
+type VoiceTranscriptionOptions = { automatic?: boolean };
+type ServiceStatus = { source: string; ok: boolean; readonly: boolean; sync?: SyncStatus; voiceTranscription?: VoiceTranscriptionStatus };
 type HeatmapDay = { date: string; count: number };
 type HeatmapData = { month: string; scope: "all" | "current"; scopeName: string; days: HeatmapDay[]; total: number; max: number; activeDays: number; peakDay: HeatmapDay | null };
 type Speaker = { senderId?: string; name: string; count: number; avatar?: Avatar };
@@ -47,6 +50,43 @@ const defaultLlmStatus: LlmStatus = { configured: false, provider: "本地模型
 const defaultSyncStatus: SyncStatus = { mode: "demo", state: "disabled", revision: "", readonly: true, lastSyncAt: 0, lagMs: null };
 const baseTime = new Date("2026-08-05T14:18:00+08:00").getTime();
 const avatar = (label: string, tone: Tone): Avatar => ({ label, tone });
+
+type LlmStreamEvent = { event: "start" | "delta" | "done" | "error" | string; data: Record<string, unknown> };
+
+async function streamLlmRequest(path: string, options: RequestInit, onEvent: (event: LlmStreamEvent) => void) {
+  const response = await fetch(`${API}${path}`, { cache: "no-store", ...options });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { error?: unknown };
+    throw new Error(typeof body.error === "string" ? body.error : String(response.status));
+  }
+  if (!response.body) throw new Error("浏览器没有提供可读取的流式响应");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const consume = (block: string) => {
+    const lines = block.split("\n");
+    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+    const payload = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+    if (!payload) return;
+    onEvent({ event, data: JSON.parse(payload) as Record<string, unknown> });
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer = `${buffer}${decoder.decode(value || new Uint8Array(), { stream: !done })}`.replace(/\r\n/g, "\n");
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        consume(buffer.slice(0, boundary));
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
+    }
+    if (buffer.trim()) consume(buffer.trim());
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 const fallbackSessions: Session[] = [
   { username: "ai-lab@chatroom", name: "AI 技术交流群", avatar: avatar("AI", "blue"), lastMessage: "本周 Agent 评测结论已经整理好了", timestamp: baseTime - 180000, unread: 8, pinned: true, isGroup: true, memberCount: 111 },
@@ -342,7 +382,7 @@ function MessageText({ content }: { content: string }) {
   );
 }
 
-function MessageCard({ message, quotedMessage, onCopy, onQuote, onPreview, onTranscribe, transcribing, onJumpOriginal }: { message: Message; quotedMessage?: Message; onCopy: (text: string) => void; onQuote: (message: Message) => void; onPreview: (preview: ImagePreview) => void; onTranscribe: (message: Message) => void; transcribing?: boolean; onJumpOriginal?: () => void }) {
+function MessageCard({ message, quotedMessage, onCopy, onQuote, onPreview, onTranscribe, transcribing, automaticTranscriptionReady, onJumpOriginal }: { message: Message; quotedMessage?: Message; onCopy: (text: string) => void; onQuote: (message: Message) => void; onPreview: (preview: ImagePreview) => void; onTranscribe: (message: Message) => void; transcribing?: boolean; automaticTranscriptionReady?: boolean; onJumpOriginal?: () => void }) {
   const [failedMediaKey, setFailedMediaKey] = useState("");
   if (message.type === "system") {
     return <div className="system-message"><span>{message.content}</span></div>;
@@ -408,11 +448,13 @@ function MessageCard({ message, quotedMessage, onCopy, onQuote, onPreview, onTra
       const transcript = String(message.meta?.transcript || "").trim();
       const transcriptionAvailable = message.meta?.transcriptionAvailable === true;
       const transcriptionError = String(message.meta?.transcriptionError || "").trim();
+      const transcriptionStatus = String(message.meta?.transcriptionStatus || "").trim();
       const model = String(message.meta?.transcriptionModel || "").trim();
+      const noSpeech = transcriptionStatus === "no-speech";
       return (
         <div className="voice-message-card">
           <div className="voice-card"><span className="voice-play">▶</span><span className="voice-wave">▁▃▆▂▅▇▃▆▂▅</span><small>{String(message.meta?.duration || "语音")}</small></div>
-          {transcript ? <><p className="voice-transcript available">{transcript}</p><small className="voice-transcript-source">本机 Whisper{model ? ` · ${model}` : ""}</small></> : <div className={`voice-transcript-action ${transcriptionError ? "error" : ""}`}><span>{transcribing ? "正在本机转写…" : transcriptionError || (transcriptionAvailable ? "尚未生成文字" : "本地语音数据暂不可用")}</span>{transcriptionAvailable && !transcriptionError ? <button type="button" disabled={transcribing} onClick={(event) => { event.stopPropagation(); onTranscribe(message); }}>{transcribing ? "处理中" : "转为文字"}</button> : null}{transcriptionError ? <button type="button" disabled={transcribing} onClick={(event) => { event.stopPropagation(); onTranscribe(message); }}>重试</button> : null}</div>}
+          {transcript ? <><p className="voice-transcript available">{transcript}</p><small className="voice-transcript-source">本机 Whisper{model ? ` · ${model}` : ""}</small></> : <div className={`voice-transcript-action ${transcriptionError ? "error" : ""}`}><span>{transcribing ? "正在本机自动转写…" : transcriptionError || (noSpeech ? "未识别到清晰语音" : transcriptionAvailable ? (automaticTranscriptionReady ? "等待本机自动转写…" : "本地自动转写尚未就绪") : "本地语音数据暂不可用")}</span>{(transcriptionError || noSpeech) && transcriptionAvailable ? <button type="button" disabled={transcribing} onClick={(event) => { event.stopPropagation(); onTranscribe(message); }}>{transcribing ? "处理中" : "重试"}</button> : null}</div>}
         </div>
       );
     }
@@ -576,6 +618,8 @@ export default function Home() {
   const conversationRequestRef = useRef(0);
   const pendingLatestSessionRef = useRef(selectedId);
   const suppressTimelineScrollRef = useRef(true);
+  const activeVoiceJobRef = useRef("");
+  const automaticVoiceAttemptsRef = useRef<Set<string>>(new Set());
 
   const selected = sessions.find((item) => item.username === selectedId) || sessions[0] || fallbackSessions[0];
   const contactSession = contactDetail ? sessions.find((item) => item.username === contactDetail.username) : undefined;
@@ -610,6 +654,55 @@ export default function Home() {
     return body;
   }, []);
 
+  const transcribeVoice = useCallback(async (message: Message, options: VoiceTranscriptionOptions = {}) => {
+    const username = selected.username;
+    const localId = Number(message.meta?.localId || 0);
+    if (!Number.isSafeInteger(localId) || localId < 0) {
+      if (!options.automatic) {
+        setToast("这条语音缺少本地索引");
+        window.setTimeout(() => setToast(""), 1800);
+      }
+      return;
+    }
+    const messageId = String(message.id);
+    const jobKey = `${username}:${messageId}`;
+    if (activeVoiceJobRef.current) {
+      if (!options.automatic) {
+        setToast("另一条语音正在本机转写，请稍候");
+        window.setTimeout(() => setToast(""), 1800);
+      }
+      return;
+    }
+    const updateCurrentConversation = (updater: (item: Message) => Message) => {
+      if (selectedIdRef.current !== username || messagesSessionRef.current !== username) return;
+      setMessages((current) => current.map((item) => String(item.id) === messageId ? updater(item) : item));
+    };
+    activeVoiceJobRef.current = jobKey;
+    setTranscribingVoiceId(messageId);
+    updateCurrentConversation((item) => ({ ...item, meta: { ...item.meta, transcriptionError: "" } }));
+    try {
+      const data = await getJson(`/chats/${encodeURIComponent(username)}/voice/${localId}/transcript`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ serverId: message.serverId || message.meta?.serverId || "", createTime: message.meta?.createTime || message.timestamp }),
+      });
+      const transcription = data.transcription || {};
+      const transcript = String(transcription.transcript || "").trim();
+      updateCurrentConversation((item) => ({ ...item, meta: { ...item.meta, transcript, transcriptionStatus: transcription.status || (transcript ? "available" : "no-speech"), transcriptionEngine: transcription.engine || "openai-whisper-local", transcriptionModel: transcription.model || "", transcriptionError: "" } }));
+      if (!options.automatic) {
+        setToast(transcript ? (transcription.cached ? "已读取本机转写缓存" : "语音已转为文字") : "这条语音没有识别到清晰内容");
+      }
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : "本地转写失败";
+      updateCurrentConversation((item) => ({ ...item, meta: { ...item.meta, transcriptionError: messageText } }));
+      if (!options.automatic) setToast(messageText);
+    } finally {
+      if (activeVoiceJobRef.current === jobKey) activeVoiceJobRef.current = "";
+      setTranscribingVoiceId("");
+      if (!options.automatic) window.setTimeout(() => setToast(""), 2600);
+    }
+  }, [getJson, selected.username]);
+
   const refreshContacts = useCallback(async () => {
     const data = await getJson("/contacts");
     if (!stableContactPayload(data)) throw new Error("联系人快照正在切换");
@@ -617,10 +710,6 @@ export default function Home() {
     contactRevisionRef.current = String(data.revision || "");
     return data;
   }, [getJson]);
-
-  useEffect(() => {
-    setContactVisibleLimit(240);
-  }, [contactKindFilter, contacts, query]);
 
   useEffect(() => {
     let cancelled = false;
@@ -693,16 +782,39 @@ export default function Home() {
   }, [messages]);
 
   useEffect(() => {
+    automaticVoiceAttemptsRef.current.clear();
+  }, [selected.username]);
+
+  useEffect(() => {
+    if (!service.voiceTranscription?.wechatVoiceReady || conversationLoading || transcribingVoiceId || !["chats", "official"].includes(view)) return;
+    const candidate = [...messages].reverse().find((message) => {
+      if (message.type !== "voice" || message.meta?.transcriptionAvailable !== true) return false;
+      if (String(message.meta?.transcript || "").trim() || String(message.meta?.transcriptionError || "").trim()) return false;
+      if (["available", "no-speech"].includes(String(message.meta?.transcriptionStatus || ""))) return false;
+      const localId = Number(message.meta?.localId || 0);
+      if (!Number.isSafeInteger(localId) || localId < 0) return false;
+      const attemptKey = `${selected.username}:${String(message.id)}:${String(message.meta?.mediaRevision || "")}`;
+      return !automaticVoiceAttemptsRef.current.has(attemptKey);
+    });
+    if (!candidate) return;
+    const attemptKey = `${selected.username}:${String(candidate.id)}:${String(candidate.meta?.mediaRevision || "")}`;
+    automaticVoiceAttemptsRef.current.add(attemptKey);
+    const timer = window.setTimeout(() => { void transcribeVoice(candidate, { automatic: true }); }, 280);
+    return () => window.clearTimeout(timer);
+  }, [conversationLoading, messages, selected.username, service.voiceTranscription?.wechatVoiceReady, transcribeVoice, transcribingVoiceId, view]);
+
+  useEffect(() => {
     periodRef.current = period;
   }, [period]);
 
   useEffect(() => {
     if (rightTab !== "heat") return;
     let cancelled = false;
-    setHeatLoading(true);
-    setHeatError("");
-    setHeatmap(null);
     const timer = window.setTimeout(async () => {
+      if (cancelled) return;
+      setHeatLoading(true);
+      setHeatError("");
+      setHeatmap(null);
       try {
         const params = new URLSearchParams({ month: heatMonth });
         if (heatScope === "current") params.set("chat", selected.username);
@@ -853,7 +965,7 @@ export default function Home() {
   }, [conversationLoading, messages, selectedId]);
 
   useEffect(() => {
-    llmThreadRef.current?.scrollTo({ top: llmThreadRef.current.scrollHeight, behavior: "smooth" });
+    llmThreadRef.current?.scrollTo({ top: llmThreadRef.current.scrollHeight, behavior: llmLoading ? "auto" : "smooth" });
   }, [llmTurns, llmLoading]);
 
   const loadLlmHistory = useCallback(async () => {
@@ -1116,28 +1228,61 @@ export default function Home() {
       return;
     }
     const userTurn: LlmTurn = { id: crypto.randomUUID(), role: "user", content };
+    const assistantId = crypto.randomUUID();
+    const assistantTurn: LlmTurn = { id: assistantId, role: "assistant", content: "", streaming: true };
     const history = llmTurns.filter((turn) => !turn.error).map((turn) => ({ role: turn.role, content: turn.content }));
-    setLlmTurns((current) => [...current, userTurn]);
+    const hadConversation = Boolean(llmConversationId);
+    setLlmTurns((current) => [...current, userTurn, assistantTurn]);
     setLlmInput("");
     setLlmLoading(true);
+    const controller = new AbortController();
+    let streamedContent = "";
+    let completed = false;
+    let paintFrame = 0;
+    const paintStream = () => {
+      paintFrame = 0;
+      setLlmTurns((current) => current.map((turn) => turn.id === assistantId ? { ...turn, content: streamedContent } : turn));
+    };
     try {
-      const data = await getJson("/llm/chat", {
+      await streamLlmRequest("/llm/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ username: selected.username, question: content, modelId: selectedLlmModel.id, conversationId: llmConversationId, history, referenceIds: quotedMessages.map((message) => message.id) }),
+        signal: controller.signal,
+        body: JSON.stringify({ username: selected.username, question: content, modelId: selectedLlmModel.id, conversationId: llmConversationId, history, referenceIds: quotedMessages.map((message) => message.id), stream: true }),
+      }, (event) => {
+        if (event.event === "delta") {
+          const delta = typeof event.data.delta === "string" ? event.data.delta : "";
+          if (!delta) return;
+          streamedContent += delta;
+          if (!paintFrame) paintFrame = window.requestAnimationFrame(paintStream);
+          return;
+        }
+        if (event.event === "error") {
+          throw new Error(typeof event.data.error === "string" ? event.data.error : "LLM 流式请求失败，请稍后重试。");
+        }
+        if (event.event !== "done") return;
+        const result = event.data.result as LlmChatResult | undefined;
+        if (!result?.answer) throw new Error("LLM 没有返回可显示的文本");
+        completed = true;
+        streamedContent = result.answer;
+        if (paintFrame) window.cancelAnimationFrame(paintFrame);
+        paintFrame = 0;
+        setLlmTurns((current) => current.map((turn) => turn.id === assistantId ? { ...turn, content: result.answer, citations: result.citations || [], model: result.model, contextMessages: result.contextMessages, usage: result.usage, streaming: false } : turn));
+        if (result.conversationId) setLlmConversationId(result.conversationId);
+        if (event.data.conversation) setLlmStatus((current) => ({ ...current, history: { ...current.history, conversationCount: Math.max(current.history.conversationCount, hadConversation ? current.history.conversationCount : current.history.conversationCount + 1) } }));
+        setQuotedMessages([]);
       });
-      const result = data.result;
-      setLlmTurns((current) => [...current, { id: crypto.randomUUID(), role: "assistant", content: result.answer, citations: result.citations || [], model: result.model, contextMessages: result.contextMessages, usage: result.usage }]);
-      if (result.conversationId) setLlmConversationId(result.conversationId);
-      if (data.conversation) setLlmStatus((current) => ({ ...current, history: { ...current.history, conversationCount: Math.max(current.history.conversationCount, llmConversationId ? current.history.conversationCount : current.history.conversationCount + 1) } }));
-      setQuotedMessages([]);
+      if (!completed) throw new Error("LLM 流式响应意外结束，请重试。");
     } catch (error) {
-      setLlmTurns((current) => [...current, { id: crypto.randomUUID(), role: "assistant", content: error instanceof Error ? error.message : "LLM 请求失败，请稍后重试。", error: true }]);
+      controller.abort();
+      const detail = error instanceof Error ? error.message : "LLM 请求失败，请稍后重试。";
+      setLlmTurns((current) => current.map((turn) => turn.id === assistantId ? { ...turn, content: streamedContent ? `${streamedContent}\n\n生成中断：${detail}` : detail, error: true, streaming: false } : turn));
       try {
         const llmData = await getJson("/llm/status");
         if (llmData.llm) setLlmStatus(normalizeLlmStatus(llmData.llm));
       } catch {}
     } finally {
+      if (paintFrame) window.cancelAnimationFrame(paintFrame);
       setLlmLoading(false);
     }
   }
@@ -1266,36 +1411,6 @@ export default function Home() {
     window.setTimeout(() => setToast(""), 1600);
   }
 
-  async function transcribeVoice(message: Message) {
-    const localId = Number(message.meta?.localId || 0);
-    if (!Number.isSafeInteger(localId) || localId < 0) {
-      setToast("这条语音缺少本地索引");
-      window.setTimeout(() => setToast(""), 1800);
-      return;
-    }
-    const messageId = String(message.id);
-    setTranscribingVoiceId(messageId);
-    setMessages((current) => current.map((item) => String(item.id) === messageId ? { ...item, meta: { ...item.meta, transcriptionError: "" } } : item));
-    try {
-      const data = await getJson(`/chats/${encodeURIComponent(selected.username)}/voice/${localId}/transcript`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ serverId: message.serverId || message.meta?.serverId || "", createTime: message.meta?.createTime || message.timestamp }),
-      });
-      const transcription = data.transcription || {};
-      const transcript = String(transcription.transcript || "").trim();
-      setMessages((current) => current.map((item) => String(item.id) === messageId ? { ...item, meta: { ...item.meta, transcript, transcriptionStatus: transcription.status || (transcript ? "available" : "no-speech"), transcriptionEngine: transcription.engine || "openai-whisper-local", transcriptionModel: transcription.model || "", transcriptionError: "" } } : item));
-      setToast(transcript ? (transcription.cached ? "已读取本机转写缓存" : "语音已转为文字") : "这条语音没有识别到清晰内容");
-    } catch (error) {
-      const messageText = error instanceof Error ? error.message : "本地转写失败";
-      setMessages((current) => current.map((item) => String(item.id) === messageId ? { ...item, meta: { ...item.meta, transcriptionError: messageText } } : item));
-      setToast(messageText);
-    } finally {
-      setTranscribingVoiceId("");
-      window.setTimeout(() => setToast(""), 2600);
-    }
-  }
-
   const navTitle = view === "official" ? "公众号与服务号" : view === "contacts" ? "联系人" : view === "search" ? "消息搜索" : view === "insights" ? "本地洞察" : "聊天";
   const speakerMax = Math.max(1, ...summary.topSpeakers.map((item) => item.count));
   const heatLeadingCells = heatmap ? (new Date(`${heatmap.month}-01T00:00:00+08:00`).getDay() + 6) % 7 : 0;
@@ -1338,8 +1453,8 @@ export default function Home() {
         </div>
         <div className="search-box">
           <span>⌕</span>
-          <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => event.key === "Enter" && runSearch()} placeholder={view === "contacts" ? "搜索联系人" : view === "official" ? "搜索公众号与服务号" : "搜索会话与消息"} aria-label="搜索" />
-          {query ? <button onClick={() => setQuery("")} aria-label="清空搜索">×</button> : <kbd>⌘K</kbd>}
+          <input ref={searchRef} value={query} onChange={(event) => { setQuery(event.target.value); if (view === "contacts") setContactVisibleLimit(240); }} onKeyDown={(event) => event.key === "Enter" && runSearch()} placeholder={view === "contacts" ? "搜索联系人" : view === "official" ? "搜索公众号与服务号" : "搜索会话与消息"} aria-label="搜索" />
+          {query ? <button onClick={() => { setQuery(""); if (view === "contacts") setContactVisibleLimit(240); }} aria-label="清空搜索">×</button> : <kbd>⌘K</kbd>}
         </div>
 
         {view === "contacts" ? (
@@ -1348,8 +1463,8 @@ export default function Home() {
             if (target.scrollHeight - target.scrollTop - target.clientHeight < 320) setContactVisibleLimit((current) => Math.min(current + 240, filteredContacts.length));
           }}>
             <div className="contact-kind-tabs" aria-label="联系人分类">
-              <button className={contactKindFilter === "contact" ? "active" : ""} onClick={() => setContactKindFilter("contact")}><span>联系人</span><em>{contactCounts.contact}</em></button>
-              <button className={contactKindFilter === "group" ? "active" : ""} onClick={() => setContactKindFilter("group")}><span>群聊</span><em>{contactCounts.group}</em></button>
+              <button className={contactKindFilter === "contact" ? "active" : ""} onClick={() => { setContactKindFilter("contact"); setContactVisibleLimit(240); }}><span>联系人</span><em>{contactCounts.contact}</em></button>
+              <button className={contactKindFilter === "group" ? "active" : ""} onClick={() => { setContactKindFilter("group"); setContactVisibleLimit(240); }}><span>群聊</span><em>{contactCounts.group}</em></button>
             </div>
             <div className="section-caption"><span>{contactKindFilter === "group" ? "已保存的群聊" : "微信通讯录"}</span><em>{filteredContacts.length}</em></div>
             {visibleContacts.map((contact) => (
@@ -1411,7 +1526,7 @@ export default function Home() {
             {visibleMessages.map((message) => {
               const quoteServerId = String(message.meta?.quoteServerId || "");
               const quotedMessage = quoteServerId ? messagesByServerId.get(quoteServerId) : undefined;
-              return <MessageCard key={String(message.id)} message={message} quotedMessage={quotedMessage} onCopy={copyText} onQuote={quoteForLlm} onPreview={setImagePreview} onTranscribe={(item) => void transcribeVoice(item)} transcribing={transcribingVoiceId === String(message.id)} onJumpOriginal={quotedMessage ? () => jumpToCitation(quotedMessage.id) : undefined} />;
+              return <MessageCard key={String(message.id)} message={message} quotedMessage={quotedMessage} onCopy={copyText} onQuote={quoteForLlm} onPreview={setImagePreview} onTranscribe={(item) => void transcribeVoice(item)} transcribing={transcribingVoiceId === String(message.id)} automaticTranscriptionReady={service.voiceTranscription?.wechatVoiceReady === true} onJumpOriginal={quotedMessage ? () => jumpToCitation(quotedMessage.id) : undefined} />;
             })}
             {!visibleMessages.length && <div className="empty-state"><span>▧</span><p>当前记录中没有媒体或文件</p><small>再次点击顶部媒体按钮返回全部消息</small></div>}
             <div className={`timeline-end ${hasPendingLatest ? "pending" : ""}`}><span>{hasPendingLatest ? "↓" : "✓"}</span> {hasPendingLatest ? "当前会话的新消息已更新，向下查看" : liveMode ? "已同步至最新快照" : "已到最新消息"}</div>
@@ -1469,13 +1584,12 @@ export default function Home() {
                 )}
 
                 <div className="llm-thread">
-                  {llmTurns.map((turn) => <article key={turn.id} className={`llm-turn ${turn.role} ${turn.error ? "error" : ""}`}>
-                    <div className="llm-turn-meta"><span>{turn.role === "user" ? "你" : "✦ LLM"}</span>{turn.role === "assistant" && <button onClick={() => copyText(turn.content)}>复制</button>}</div>
-                    {turn.role === "assistant" && !turn.error ? <LlmReadableContent content={turn.content} citations={turn.citations} onCitation={jumpToCitation} /> : <p>{turn.content}</p>}
+                  {llmTurns.map((turn) => <article key={turn.id} className={`llm-turn ${turn.role} ${turn.error ? "error" : ""} ${turn.streaming ? "streaming" : ""}`}>
+                    <div className="llm-turn-meta"><span>{turn.role === "user" ? "你" : "✦ LLM"}{turn.streaming ? <small>生成中</small> : null}</span>{turn.role === "assistant" && !turn.streaming && <button onClick={() => copyText(turn.content)}>复制</button>}</div>
+                    {turn.role === "assistant" && !turn.error ? (turn.content ? <LlmReadableContent content={turn.content} citations={turn.citations} onCitation={jumpToCitation} /> : <p><LoadingDots /> 正在连接模型并读取群聊…</p>) : <p>{turn.content}</p>}
                     {turn.citations && turn.citations.length > 0 && <div className="llm-citations">{turn.citations.map((citation) => <button key={`${turn.id}-${citation.id}`} onClick={() => jumpToCitation(citation.id)}><b>{citation.label || "原文"}</b><span>{citation.sender}</span></button>)}</div>}
-                    {turn.role === "assistant" && !turn.error && <footer><span>{turn.model}</span><span>{turn.contextMessages} 条上下文</span>{turn.usage?.totalTokens ? <span>{turn.usage.totalTokens} tokens</span> : null}</footer>}
+                    {turn.role === "assistant" && !turn.error && !turn.streaming && <footer><span>{turn.model}</span><span>{turn.contextMessages} 条上下文</span>{turn.usage?.totalTokens ? <span>{turn.usage.totalTokens} tokens</span> : null}</footer>}
                   </article>)}
-                  {llmLoading && <article className="llm-turn assistant pending"><div className="llm-turn-meta"><span>✦ LLM</span></div><p><LoadingDots /> 正在阅读群聊并组织引用…</p></article>}
                 </div>
               </>
             )}
@@ -1585,6 +1699,7 @@ export default function Home() {
           <div className="safety-banner"><span>✓</span><div><strong>只读保护已启用</strong><p>凭据仅由本机服务读取；实时同步只读取微信数据库，不包含消息发送或数据库写入能力。</p></div></div>
           <div className="setting-row"><div><strong>数据来源</strong><span>{liveMode ? `微信实时只读快照 · ${syncLabel}` : service.source === "local-snapshot" ? "已解密的本地快照" : "安全演示数据"}</span></div><em className={service.ok ? "ok" : "warn"}>{liveMode ? (sync.state === "live" ? "实时" : "同步中") : service.ok ? "已连接" : "演示"}</em></div>
           <div className="setting-row"><div><strong>网络范围</strong><span>服务仅监听 127.0.0.1</span></div><em className="ok">本机</em></div>
+          <div className="setting-row"><div><strong>本地语音转写</strong><span>{service.voiceTranscription?.wechatVoiceReady ? `Whisper ${service.voiceTranscription.model} · 当前会话自动串行转写` : service.voiceTranscription?.blockers?.join("；") || "正在检查本机语音组件"}</span></div><em className={service.voiceTranscription?.wechatVoiceReady ? "ok" : "warn"}>{service.voiceTranscription?.wechatVoiceReady ? "自动" : "待完善"}</em></div>
           <div className="setting-row"><div><strong>LLM 模型目录</strong><span>{llmStatus.configured ? `${llmStatus.credentialSource} · ${llmStatus.models.length} 个可选模型` : "尚未检测到可用凭据"}</span></div><em className={llmStatus.configured ? "ok" : "warn"}>{llmStatus.configured ? "已加载" : "关闭"}</em></div>
           <section className="setup-note"><h3>当前模型</h3><p>{selectedLlmModel ? `${selectedLlmModel.provider} · ${selectedLlmModel.name}（${selectedLlmModel.model}）` : "未选择模型"}</p><p>模型切换只改变下一次请求的提供方和模型，不会把 API Key 返回网页。模型权益在首次请求时由对应提供方校验。</p></section>
           {llmStatus.warnings.length > 0 && <section className="setup-note setup-warning"><h3>安全提醒</h3>{llmStatus.warnings.map((warning) => <p key={warning}>{warning}</p>)}</section>}

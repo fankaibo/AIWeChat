@@ -128,6 +128,17 @@ function chatOutputText(response) {
   return "";
 }
 
+function visibleChatText(value) {
+  const text = String(value || "");
+  const leading = text.match(/^\s*/)?.[0] || "";
+  const body = text.slice(leading.length);
+  if (!body) return "";
+  if ("<think>".startsWith(body.toLowerCase())) return "";
+  if (!body.toLowerCase().startsWith("<think>")) return text;
+  const end = body.toLowerCase().indexOf("</think>");
+  return end < 0 ? "" : body.slice(end + "</think>".length).replace(/^\s*/, "");
+}
+
 function historyInput(history = []) {
   return history.slice(-12).filter((item) => ["user", "assistant"].includes(item.role) && item.content).map((item) => ({
     role: item.role,
@@ -198,7 +209,69 @@ async function requestModel(config, payload) {
   throw new LlmRequestError(safeUpstreamDetail(last?.body, config), status >= 400 && status < 600 ? status : 502, last?.body?.error?.code || "LLM_UPSTREAM_ERROR");
 }
 
-export async function chatWithLlm({ question, session, messages, history = [], referenceIds = [], modelId = "" }, config = llmConfig()) {
+function requestSignal(timeoutMs, signal) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!signal) return timeout;
+  return typeof AbortSignal.any === "function" ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+async function requestModelStream(config, payload, signal) {
+  const apiKeys = config.apiKeys?.length ? config.apiKeys : [""];
+  let last = null;
+  for (let index = 0; index < apiKeys.length; index += 1) {
+    const headers = { "content-type": "application/json", accept: "text/event-stream", "user-agent": "Weixin-AgentOS/0.1 (local-readonly)" };
+    if (apiKeys[index]) headers.authorization = `Bearer ${apiKeys[index]}`;
+    let response;
+    try {
+      response = await fetch(config.endpoint, { method: "POST", headers, body: JSON.stringify({ ...payload, stream: true }), signal: requestSignal(config.timeoutMs, signal) });
+    } catch (error) {
+      if (signal?.aborted) throw new LlmRequestError("LLM 请求已取消。", 499, "LLM_ABORTED");
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") throw new LlmRequestError("LLM 请求超时，请稍后重试。", 504, "LLM_TIMEOUT");
+      throw new LlmRequestError("无法连接 LLM 服务，请检查本地网络和模型配置。", 502, "LLM_UNREACHABLE");
+    }
+    if (response.ok && response.body) return response;
+    const body = await response.json().catch(() => ({}));
+    last = { response, body };
+    if (![401, 402, 403, 429].includes(response.status) || index === apiKeys.length - 1) break;
+  }
+  const status = last?.response?.status || 502;
+  throw new LlmRequestError(safeUpstreamDetail(last?.body, config), status >= 400 && status < 600 ? status : 502, last?.body?.error?.code || "LLM_UPSTREAM_ERROR");
+}
+
+async function* sseEvents(stream) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer = `${buffer}${decoder.decode(value || new Uint8Array(), { stream: !done })}`.replace(/\r\n/g, "\n");
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const eventName = block.split("\n").find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+        const data = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+        if (data && data !== "[DONE]") {
+          try { yield { event: eventName, data: JSON.parse(data) }; } catch {}
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
+    }
+    const tail = buffer.trim();
+    if (tail) {
+      const data = tail.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+      if (data && data !== "[DONE]") {
+        try { yield { event: "message", data: JSON.parse(data) }; } catch {}
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function prepareLlmRequest({ question, session, messages, history = [], referenceIds = [], modelId = "" }, config) {
   const selectedModel = runtimeModel(config, modelId);
   if (!selectedModel) throw new LlmRequestError("LLM 尚未配置。请提供本机凭据文件或设置 OPENAI_API_KEY。", 503, "LLM_NOT_CONFIGURED");
   const context = selectContext(messages, question, referenceIds, selectedModel.contextLimit);
@@ -217,10 +290,7 @@ export async function chatWithLlm({ question, session, messages, history = [], r
     "使用简洁的 Markdown 排版增强可读性：短段落、清晰小标题和列表；待办事项优先使用 - [ ]，避免连续的大段文字。",
   ].join("\n");
   const userPrompt = `当前会话：${compactText(session?.name || session?.username || "未知会话", 200)}\n\n用户问题：${compactText(question, 6000)}\n\n可引用的群聊原文：\n${sourceBlock}`;
-  const input = [
-    ...historyInput(history),
-    { role: "user", content: userPrompt },
-  ];
+  const input = [...historyInput(history), { role: "user", content: userPrompt }];
   let payload;
   if (selectedModel.protocol === "responses") {
     payload = { model: selectedModel.model, instructions, input, store: false };
@@ -232,10 +302,11 @@ export async function chatWithLlm({ question, session, messages, history = [], r
   } else {
     payload = { model: selectedModel.model, messages: [{ role: "system", content: instructions }, ...historyInput(history), { role: "user", content: userPrompt }] };
   }
-  const body = await requestModel(selectedModel, payload);
-  const answer = selectedModel.protocol === "responses" ? outputText(body) : chatOutputText(body);
-  if (!answer) throw new LlmRequestError("LLM 没有返回可显示的文本。", 502, "EMPTY_LLM_RESPONSE");
+  return { selectedModel, context, payload };
+}
 
+function llmResult(answer, body, selectedModel, context) {
+  if (!answer) throw new LlmRequestError("LLM 没有返回可显示的文本。", 502, "EMPTY_LLM_RESPONSE");
   const labels = [...answer.matchAll(/\[M(\d+)\]/g)].map((match) => `M${match[1]}`);
   const cited = [...new Set(labels)].map((label) => context.find((item) => item.label === label)).filter(Boolean);
   return {
@@ -253,4 +324,44 @@ export async function chatWithLlm({ question, session, messages, history = [], r
     },
     stored: false,
   };
+}
+
+export async function chatWithLlm({ question, session, messages, history = [], referenceIds = [], modelId = "" }, config = llmConfig()) {
+  const { selectedModel, context, payload } = prepareLlmRequest({ question, session, messages, history, referenceIds, modelId }, config);
+  const body = await requestModel(selectedModel, payload);
+  const answer = selectedModel.protocol === "responses" ? outputText(body) : chatOutputText(body);
+  return llmResult(answer, body, selectedModel, context);
+}
+
+export async function streamChatWithLlm({ question, session, messages, history = [], referenceIds = [], modelId = "" }, config = llmConfig(), options = {}) {
+  const { selectedModel, context, payload } = prepareLlmRequest({ question, session, messages, history, referenceIds, modelId }, config);
+  const response = await requestModelStream(selectedModel, payload, options.signal);
+  let rawAnswer = "";
+  let emittedText = "";
+  let responseBody = {};
+  for await (const item of sseEvents(response.body)) {
+    const event = item.data || {};
+    if (selectedModel.protocol === "responses") {
+      if (event.type === "response.output_text.delta" && typeof event.delta === "string") rawAnswer += event.delta;
+      if (event.type === "response.created" && event.response) responseBody = { ...responseBody, ...event.response };
+      if (event.type === "response.completed" && event.response) responseBody = { ...responseBody, ...event.response };
+      if (event.type === "response.failed" || event.type === "error") {
+        throw new LlmRequestError(safeUpstreamDetail(event.response?.error || event.error || event, selectedModel), 502, event.response?.error?.code || event.error?.code || "LLM_STREAM_ERROR");
+      }
+    } else {
+      const content = event?.choices?.[0]?.delta?.content;
+      if (typeof content === "string") rawAnswer += content;
+      else if (Array.isArray(content)) rawAnswer += content.map((part) => typeof part === "string" ? part : part?.text || "").join("");
+      responseBody = { ...responseBody, id: event.id || responseBody.id, model: event.model || responseBody.model, usage: event.usage || responseBody.usage };
+      if (event.error) throw new LlmRequestError(safeUpstreamDetail(event, selectedModel), 502, event.error.code || "LLM_STREAM_ERROR");
+    }
+    const visible = selectedModel.protocol === "responses" ? rawAnswer : visibleChatText(rawAnswer);
+    if (visible.length > emittedText.length && visible.startsWith(emittedText)) {
+      const delta = visible.slice(emittedText.length);
+      emittedText = visible;
+      await options.onDelta?.(delta);
+    }
+  }
+  const answer = selectedModel.protocol === "responses" ? rawAnswer.trim() : chatOutputText({ choices: [{ message: { content: rawAnswer } }] });
+  return llmResult(answer, responseBody, selectedModel, context);
 }

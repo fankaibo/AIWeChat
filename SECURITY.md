@@ -22,6 +22,6 @@ The repository ignores these artifacts by default. Before every commit, review t
 
 ## Reporting a problem
 
-Because this is a private repository, report security issues directly to the repository owner. Do not include real secrets, chat content, database files, or screenshots in an issue.
+Report security issues privately to the repository owner or through GitHub private vulnerability reporting when it is enabled. Do not include real secrets, chat content, database files, or screenshots in a public issue.
 
 If a secret is committed, revoke or rotate it first, then remove it from Git history. Deleting it only from the latest commit is insufficient.

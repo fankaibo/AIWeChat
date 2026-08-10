@@ -5,7 +5,7 @@ import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { demoContacts, demoMembers, demoSessions, messagesFor } from "./demo-data.mjs";
 import { answerQuestion, summarize } from "./agent.mjs";
-import { chatWithLlm, LlmRequestError, llmConfig, publicLlmStatus } from "./llm.mjs";
+import { chatWithLlm, LlmRequestError, llmConfig, publicLlmStatus, streamChatWithLlm } from "./llm.mjs";
 import { LlmHistoryStore } from "./llm-history.mjs";
 import { loadModelCatalog } from "./model-catalog.mjs";
 import { ReadonlyStore } from "./readonly-store.mjs";
@@ -33,6 +33,22 @@ const startedAt = Date.now();
 function store() {
   if (!liveStore && ReadonlyStore.available(decryptedDir)) liveStore = new ReadonlyStore(decryptedDir, { mediaRoot });
   return liveStore;
+}
+
+function voiceStatus() {
+  const transcription = voiceTranscriber.status();
+  const mediaDatabaseReady = Boolean(store()?.mediaPaths().length);
+  const blockers = [];
+  if (!transcription.whisperReady) blockers.push("本机尚未检测到 OpenAI Whisper");
+  if (!transcription.ffmpegReady) blockers.push("本机尚未检测到 ffmpeg");
+  if (!transcription.silkDecoderReady) blockers.push("Whisper 环境尚未安装 silk-python");
+  if (!mediaDatabaseReady && store()) blockers.push("只读快照尚未包含微信 media_*.db");
+  return {
+    ...transcription,
+    mediaDatabaseReady,
+    wechatVoiceReady: Boolean(transcription.whisperReady && transcription.ffmpegReady && transcription.silkDecoderReady && mediaDatabaseReady),
+    blockers,
+  };
 }
 
 function source() {
@@ -198,6 +214,28 @@ function json(response, status, payload, origin = "") {
   }
   response.writeHead(status, headers);
   response.end(JSON.stringify(payload));
+}
+
+function eventStream(response, origin = "") {
+  const headers = {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-store, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  };
+  if (["http://localhost:3000", "http://127.0.0.1:3000"].includes(origin)) {
+    headers["access-control-allow-origin"] = origin;
+    headers.vary = "Origin";
+  }
+  response.writeHead(200, headers);
+  response.flushHeaders();
+}
+
+function streamEvent(response, event, payload) {
+  if (response.destroyed || response.writableEnded) return;
+  response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
 }
 
 function binary(response, status, payload, origin = "") {
@@ -366,12 +404,12 @@ const server = createServer(async (request, response) => {
         decryptedDirConfigured: Boolean(decryptedDir),
         keyExtraction: "disabled",
         llmConfigured: llm.configured,
-        voiceTranscription: voiceTranscriber.status(),
+        voiceTranscription: voiceStatus(),
         sync,
       }, origin);
     }
     if (url.pathname === "/api/sync/status") return json(response, 200, { sync: syncStatus(), source: source() }, origin);
-    if (url.pathname === "/api/voice/status") return json(response, 200, { transcription: voiceTranscriber.status(), source: source() }, origin);
+    if (url.pathname === "/api/voice/status") return json(response, 200, { transcription: voiceStatus(), source: source() }, origin);
     if (url.pathname === "/api/llm/status") return json(response, 200, { llm: { ...publicLlmStatus(llm), history: llmHistory.status() } }, origin);
     if (url.pathname === "/api/llm/probe" && request.method === "POST") {
       const body = await readBody(request);
@@ -471,6 +509,7 @@ const server = createServer(async (request, response) => {
       const body = await readBody(request);
       const current = store();
       if (!current) return json(response, 404, { error: "当前没有可读取的微信语音数据库", code: "VOICE_DATABASE_UNAVAILABLE" }, origin);
+      if (!current.mediaPaths().length) return json(response, 503, { error: "只读快照尚未包含微信媒体数据库，请重新捕获 media_*.db 密钥后同步", code: "VOICE_MEDIA_DATABASE_UNAVAILABLE" }, origin);
       const voice = current.voiceBlob(username, localId, String(body.serverId || ""), Number(body.createTime || 0));
       if (!voice) return json(response, 404, { error: "没有找到这条语音的本地音频数据", code: "VOICE_DATA_UNAVAILABLE" }, origin);
       const identity = { username, localId: voice.localId || localId, serverId: voice.serverId || String(body.serverId || ""), createTime: (voice.createTime || 0) * 1000 || Number(body.createTime || 0) };
@@ -534,15 +573,68 @@ const server = createServer(async (request, response) => {
       const all = messages(username, { limit: 1000 });
       const modelId = String(body.modelId || "");
       const model = llm.models?.find((item) => item.id === (modelId || llm.defaultModelId));
+      const requestArguments = {
+        question,
+        session,
+        messages: all,
+        history: Array.isArray(body.history) ? body.history : [],
+        referenceIds: Array.isArray(body.referenceIds) ? body.referenceIds.slice(0, 20) : [],
+        modelId,
+      };
+      if (body.stream === true) {
+        eventStream(response, origin);
+        streamEvent(response, "start", { modelId: modelId || llm.defaultModelId || "", source: source() });
+        const controller = new AbortController();
+        const abortOnClose = () => { if (!response.writableEnded) controller.abort(); };
+        response.on("close", abortOnClose);
+        try {
+          const result = await streamChatWithLlm(requestArguments, llm, {
+            signal: controller.signal,
+            onDelta: (delta) => streamEvent(response, "delta", { delta }),
+          });
+          if (model) {
+            model.verified = true;
+            model.lastError = "";
+            model.lastCheckedAt = Date.now();
+          }
+          let conversation = null;
+          try {
+            conversation = llmHistory.recordExchange({
+              conversationId: String(body.conversationId || ""),
+              username,
+              sessionName: session.name || session.username,
+              question,
+              answer: result.answer,
+              citations: result.citations,
+              modelId: result.modelId,
+              model: result.model,
+              provider: result.provider,
+              contextMessages: result.contextMessages,
+              usage: result.usage,
+            });
+          } catch (historyError) {
+            console.warn(`LLM history: ${historyError.message}`);
+          }
+          streamEvent(response, "done", { result: { ...result, conversationId: conversation?.id || String(body.conversationId || "") }, conversation, source: source() });
+        } catch (error) {
+          if (model && error instanceof LlmRequestError) {
+            model.verified = false;
+            model.lastError = error.message;
+            model.lastCheckedAt = Date.now();
+            console.warn(`LLM ${model.id}: ${error.code} (${error.status})`);
+          }
+          const failure = error instanceof LlmRequestError
+            ? { error: error.message, code: error.code }
+            : { error: "LLM 流式请求失败，请稍后重试。", code: "LLM_STREAM_FAILED" };
+          streamEvent(response, "error", failure);
+        } finally {
+          response.off("close", abortOnClose);
+          if (!response.writableEnded) response.end();
+        }
+        return;
+      }
       try {
-        const result = await chatWithLlm({
-          question,
-          session,
-          messages: all,
-          history: Array.isArray(body.history) ? body.history : [],
-          referenceIds: Array.isArray(body.referenceIds) ? body.referenceIds.slice(0, 20) : [],
-          modelId,
-        }, llm);
+        const result = await chatWithLlm(requestArguments, llm);
         if (model) {
           model.verified = true;
           model.lastError = "";
@@ -592,6 +684,6 @@ server.listen(port, host, () => {
   console.log("Read-only mode: enabled; key extraction and WeChat modification are disabled");
   console.log(`LLM: ${llm.configured ? `${llm.models.length} selectable models` : "not configured"}`);
   console.log(`LLM history: ${llmHistory.status().enabled ? `${llmHistory.status().conversationCount} local conversations` : "disabled"}`);
-  console.log(`Voice transcription: ${voiceTranscriber.status().configured ? `${voiceTranscriber.status().engine} (${voiceTranscriber.status().model})` : "not configured"}`);
+  console.log(`Voice transcription: ${voiceStatus().wechatVoiceReady ? `${voiceStatus().engine} (${voiceStatus().model})` : `not ready (${voiceStatus().blockers.length} blocker(s))`}`);
   for (const warning of llm.warnings) console.warn(`LLM warning: ${warning}`);
 });

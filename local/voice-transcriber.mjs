@@ -6,6 +6,7 @@ import { extname, join, resolve } from "node:path";
 
 const MAX_VOICE_BYTES = 24 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const TRANSCRIPT_CACHE_VERSION = 2;
 
 function executable(path) {
   try { accessSync(path, constants.X_OK); return true; } catch { return false; }
@@ -21,7 +22,7 @@ function firstExecutable(values) {
 
 function pythonModuleReady(pythonPath, moduleName) {
   if (!pythonPath) return false;
-  const result = spawnSync(pythonPath, ["-c", `import ${moduleName}`], { encoding: "utf8", timeout: 10_000 });
+  const result = spawnSync(pythonPath, ["-c", `import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(${JSON.stringify(moduleName)}) else 1)`], { encoding: "utf8", timeout: 10_000 });
   return !result.error && result.status === 0;
 }
 
@@ -100,6 +101,10 @@ export class LocalVoiceTranscriber {
       process.env.WEIXIN_WHISPER_PYTHON,
       this.whisperPath ? join(resolve(this.whisperPath, "..", ".."), "bin", "python") : "",
       join(homedir(), "whisper-env", "bin", "python"),
+      process.env.VIRTUAL_ENV ? join(process.env.VIRTUAL_ENV, "bin", "python") : "",
+      "/opt/homebrew/bin/python3",
+      "/usr/local/bin/python3",
+      "/usr/bin/python3",
     ]);
     this.ffmpegPath = firstExecutable([
       options.ffmpegPath,
@@ -108,26 +113,32 @@ export class LocalVoiceTranscriber {
       "/usr/local/bin/ffmpeg",
       "/usr/bin/ffmpeg",
     ]);
-    this.model = String(options.model || process.env.WEIXIN_WHISPER_MODEL || "base");
+    this.model = String(options.model || process.env.WEIXIN_WHISPER_MODEL || "small");
     this.language = String(options.language || process.env.WEIXIN_WHISPER_LANGUAGE || "zh");
     this.device = String(options.device || process.env.WEIXIN_WHISPER_DEVICE || "cpu");
+    this.beamSize = Math.max(1, Math.min(Number(options.beamSize || process.env.WEIXIN_WHISPER_BEAM_SIZE) || 5, 10));
+    this.initialPrompt = String(options.initialPrompt ?? process.env.WEIXIN_WHISPER_INITIAL_PROMPT ?? "").trim();
     this.cacheDir = resolve(options.cacheDir || process.env.WEIXIN_VOICE_TRANSCRIPT_DIR || new URL("../.local/voice-transcripts", import.meta.url).pathname);
     this.modelDir = String(options.modelDir || process.env.WEIXIN_WHISPER_MODEL_DIR || "");
+    this.whisperModuleReady = pythonModuleReady(this.pythonPath, "whisper");
     this.silkDecoderReady = pythonModuleReady(this.pythonPath, "pysilk");
     this.jobs = new Map();
   }
 
   status() {
+    const whisperReady = Boolean(this.whisperPath || this.whisperModuleReady);
     return {
-      configured: Boolean(this.whisperPath && this.pythonPath && this.ffmpegPath),
+      configured: Boolean(whisperReady && this.pythonPath && this.ffmpegPath),
       engine: "openai-whisper-local",
       model: this.model,
       language: this.language,
       device: this.device,
-      whisperReady: Boolean(this.whisperPath),
+      whisperReady,
+      whisperCliReady: Boolean(this.whisperPath),
+      whisperModuleReady: this.whisperModuleReady,
       silkDecoderReady: this.silkDecoderReady,
       ffmpegReady: Boolean(this.ffmpegPath),
-      wechatVoiceReady: Boolean(this.whisperPath && this.pythonPath && this.ffmpegPath && this.silkDecoderReady),
+      wechatVoiceReady: Boolean(whisperReady && this.pythonPath && this.ffmpegPath && this.silkDecoderReady),
       localOnly: true,
       cacheEnabled: true,
     };
@@ -140,7 +151,10 @@ export class LocalVoiceTranscriber {
   cached(identity) {
     try {
       const value = JSON.parse(readFileSync(this.cachePath(identity), "utf8"));
-      return value?.status === "available" || value?.status === "no-speech" ? value : null;
+      const usableStatus = value?.status === "available" || value?.status === "no-speech";
+      const currentEngine = value?.engine === "openai-whisper-local";
+      const currentConfiguration = value?.cacheVersion === TRANSCRIPT_CACHE_VERSION && value?.model === this.model && value?.language === this.language;
+      return usableStatus && currentEngine && currentConfiguration ? value : null;
     } catch {
       return null;
     }
@@ -167,7 +181,7 @@ export class LocalVoiceTranscriber {
     const temporary = mkdtempSync(join(tmpdir(), "weixin-agentos-voice-"));
     try {
       const format = audioFormat(bytes);
-      if (format.kind === "silk" && !this.silkDecoderReady) throw new VoiceTranscriptionError("本机 Whisper 已连接，但微信 SILK 解码模块尚未安装", "SILK_DECODER_NOT_CONFIGURED", 503);
+      if (format.kind === "silk" && !this.silkDecoderReady) throw new VoiceTranscriptionError("本机 Whisper 已连接，但同一 Python 环境尚未安装 silk-python", "SILK_DECODER_NOT_CONFIGURED", 503);
       const rawPath = join(temporary, `voice.${format.extension}`);
       writeFileSync(rawPath, format.offset ? bytes.subarray(format.offset) : bytes, { mode: 0o600 });
       let audioPath = rawPath;
@@ -199,11 +213,15 @@ export class LocalVoiceTranscriber {
         "--output_format", "txt",
         "--verbose", "False",
         "--fp16", "False",
+        "--temperature", "0",
+        "--beam_size", String(this.beamSize),
+        "--patience", "1.0",
         "--threads", String(Math.max(1, Math.min(Number(process.env.WEIXIN_WHISPER_THREADS) || 4, 8))),
       ];
       if (this.modelDir) args.push("--model_dir", this.modelDir);
+      if (this.initialPrompt) args.push("--initial_prompt", this.initialPrompt);
       try {
-        await run(this.whisperPath, args);
+        await run(this.whisperPath || this.pythonPath, this.whisperPath ? args : ["-m", "whisper", ...args]);
       } catch (error) {
         throw new VoiceTranscriptionError(`Whisper 转写失败：${error.message}`, "WHISPER_EXECUTION_FAILED", 500);
       }
@@ -217,6 +235,7 @@ export class LocalVoiceTranscriber {
         language: this.language,
         localOnly: true,
         cached: false,
+        cacheVersion: TRANSCRIPT_CACHE_VERSION,
         createdAt: Date.now(),
         audioHash: createHash("sha256").update(bytes).digest("hex"),
       };
